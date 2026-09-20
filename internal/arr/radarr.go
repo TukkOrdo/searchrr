@@ -37,7 +37,7 @@ func (r *Radarr) Search(ctx context.Context, term string) ([]Movie, error) {
 	return movies, err
 }
 
-func (r *Radarr) inLibrary(ctx context.Context, tmdbID int) (*Movie, error) {
+func (r *Radarr) InLibrary(ctx context.Context, tmdbID int) (*Movie, error) {
 	var movies []Movie
 	if err := r.get(ctx, "/movie", url.Values{"tmdbId": {strconv.Itoa(tmdbID)}}, &movies); err != nil {
 		return nil, err
