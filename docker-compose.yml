@@ -1,0 +1,7 @@
+services:
+  searchrr:
+    build: .
+    image: searchrr:1.0.0
+    container_name: searchrr
+    restart: unless-stopped
+    env_file: .env
