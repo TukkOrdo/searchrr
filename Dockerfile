@@ -9,5 +9,4 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /searchrr ./cmd/searchr
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /searchrr /searchrr
-USER 65534:65534
 ENTRYPOINT ["/searchrr"]

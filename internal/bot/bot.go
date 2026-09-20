@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -11,13 +12,18 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"searchrr/internal/arr"
+	"searchrr/internal/config"
+	"searchrr/internal/store"
 )
 
 const maxOptions = 25
 
 type Bot struct {
+	Cfg    *config.Config
 	Radarr *arr.Radarr
 	Sonarr *arr.Sonarr
+	// nil when notifications are off
+	Store *store.Store
 }
 
 type view struct {
@@ -50,7 +56,7 @@ func (b *Bot) Commands() []*discordgo.ApplicationCommand {
 			Options:     title,
 		})
 	}
-	dm := false
+	dm := b.Cfg.AllowDMs
 	return []*discordgo.ApplicationCommand{{
 		Name:         "request",
 		Description:  "Request a movie or TV show",
@@ -63,6 +69,7 @@ func (b *Bot) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	uid := userID(i)
 	var v view
 	var err error
 
@@ -74,24 +81,36 @@ func (b *Bot) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 		}
 		sub := data.Options[0]
 		term := strings.TrimSpace(sub.Options[0].StringValue())
+		if reason := b.denied(i, sub.Name); reason != "" {
+			b.refuse(s, i, reason)
+			return
+		}
 		if !b.ack(s, i, discordgo.InteractionResponseDeferredChannelMessageWithSource) {
 			return
 		}
 		switch {
 		case sub.Name == "movie" && b.Radarr != nil:
-			v, err = b.searchMovies(ctx, term)
+			v, err = b.searchMovies(ctx, uid, term)
 		case sub.Name == "tv" && b.Sonarr != nil:
-			v, err = b.searchShows(ctx, term)
+			v, err = b.searchShows(ctx, uid, term)
 		default:
 			v = view{content: "That command is not enabled."}
 		}
 
 	case discordgo.InteractionMessageComponent:
 		data := i.MessageComponentData()
+		parts := strings.Split(data.CustomID, ":")
+		if len(parts) < 2 {
+			return
+		}
+		if parts[1] != uid {
+			b.refuse(s, i, "This is someone else's request. Use `/request` to make your own.")
+			return
+		}
 		if !b.ack(s, i, discordgo.InteractionResponseDeferredMessageUpdate) {
 			return
 		}
-		v, err = b.onComponent(ctx, i, data)
+		v, err = b.onComponent(ctx, i, data, parts)
 
 	default:
 		return
@@ -118,79 +137,147 @@ func (b *Bot) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 	}
 }
 
-func (b *Bot) ack(s *discordgo.Session, i *discordgo.InteractionCreate, kind discordgo.InteractionResponseType) bool {
+// Reason the command can't be used here, or "".
+func (b *Bot) denied(i *discordgo.InteractionCreate, sub string) string {
+	if i.GuildID == "" {
+		if !b.Cfg.AllowDMs {
+			return "Requests through private messages are disabled."
+		}
+		return ""
+	}
+	if ch := b.Cfg.MonitoredChannels; len(ch) > 0 && !slices.Contains(ch, i.ChannelID) {
+		return "This command is not available in this channel."
+	}
+	roles := b.Cfg.MovieRoles
+	if sub == "tv" {
+		roles = b.Cfg.TVRoles
+	}
+	if len(roles) == 0 {
+		return ""
+	}
+	if i.Member != nil && slices.ContainsFunc(i.Member.Roles, func(r string) bool { return slices.Contains(roles, r) }) {
+		return ""
+	}
+	return "You do not have the required role to use this command, please ask the server owner to give you permission."
+}
+
+func (b *Bot) refuse(s *discordgo.Session, i *discordgo.InteractionCreate, reason string) {
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: kind,
-		Data: &discordgo.InteractionResponseData{Flags: discordgo.MessageFlagsEphemeral},
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Content: reason, Flags: discordgo.MessageFlagsEphemeral},
 	})
+	if err != nil {
+		log.Printf("discord response failed: %v", err)
+	}
+}
+
+func (b *Bot) ack(s *discordgo.Session, i *discordgo.InteractionCreate, kind discordgo.InteractionResponseType) bool {
+	data := &discordgo.InteractionResponseData{}
+	if b.Cfg.HideRequests {
+		data.Flags = discordgo.MessageFlagsEphemeral
+	}
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{Type: kind, Data: data})
 	if err != nil {
 		log.Printf("discord ack failed: %v", err)
 	}
 	return err == nil
 }
 
-func (b *Bot) onComponent(ctx context.Context, i *discordgo.InteractionCreate, data discordgo.MessageComponentInteractionData) (view, error) {
-	parts := strings.Split(data.CustomID, ":")
+// Custom ids are action:userID[:args].
+func (b *Bot) onComponent(ctx context.Context, i *discordgo.InteractionCreate, data discordgo.MessageComponentInteractionData, parts []string) (view, error) {
+	action, uid, args := parts[0], parts[1], parts[2:]
 	value := ""
 	if len(data.Values) > 0 {
 		value = data.Values[0]
 	}
 	menus := keptMenus(i.Message, data.CustomID, value)
+	id := 0
+	if len(args) > 0 {
+		id, _ = strconv.Atoi(args[0])
+	}
 
 	switch {
-	case data.CustomID == "m:sel" && b.Radarr != nil:
-		id, _ := strconv.Atoi(value)
+	case action == "msel" && b.Radarr != nil:
+		id, _ = strconv.Atoi(value)
 		m, err := b.Radarr.Find(ctx, id)
 		if err != nil {
 			return view{}, err
 		}
-		v := movieView(m)
+		v := b.movieView(m, uid)
 		v.rows = append(menus, v.rows...)
 		return v, nil
 
-	case len(parts) == 3 && parts[0] == "m" && parts[1] == "req" && b.Radarr != nil:
-		id, _ := strconv.Atoi(parts[2])
+	case action == "mreq" && len(args) == 1 && b.Radarr != nil:
 		m, err := b.Radarr.Request(ctx, id)
 		if err != nil {
 			return view{}, err
 		}
 		log.Printf("%s requested movie %q (tmdb:%d)", who(i), m.Title, m.TmdbID)
-		return view{content: "✅ **" + m.Title + "** has been requested.", embed: movieEmbed(m)}, nil
+		content := "**" + m.Title + "** has been requested."
+		if b.Store != nil && b.Cfg.NotifyRequesters {
+			b.Store.AddMovie(m.TmdbID, uid)
+			content += " You will be notified when it's available."
+		}
+		return view{content: content, embed: movieEmbed(m)}, nil
 
-	case data.CustomID == "t:sel" && b.Sonarr != nil:
-		id, _ := strconv.Atoi(value)
-		show, err := b.Sonarr.Find(ctx, id)
+	case action == "mnote" && len(args) == 1 && b.Radarr != nil && b.Store != nil:
+		m, err := b.Radarr.Find(ctx, id)
 		if err != nil {
 			return view{}, err
 		}
-		v := showView(show)
+		b.Store.AddMovie(m.TmdbID, uid)
+		v := b.movieView(m, uid)
 		v.rows = append(menus, v.rows...)
 		return v, nil
 
-	case len(parts) == 3 && parts[0] == "t" && parts[1] == "season" && b.Sonarr != nil:
-		id, _ := strconv.Atoi(parts[2])
+	case action == "tsel" && b.Sonarr != nil:
+		id, _ = strconv.Atoi(value)
 		show, err := b.Sonarr.Find(ctx, id)
 		if err != nil {
 			return view{}, err
 		}
-		return view{embed: showEmbed(show), rows: append(menus, seasonButton(show, value))}, nil
+		v := showView(show, uid)
+		v.rows = append(menus, v.rows...)
+		return v, nil
 
-	case len(parts) == 4 && parts[0] == "t" && parts[1] == "req" && b.Sonarr != nil:
-		id, _ := strconv.Atoi(parts[2])
-		show, err := b.Sonarr.Request(ctx, id, parts[3])
+	case action == "tseason" && len(args) == 1 && b.Sonarr != nil:
+		show, err := b.Sonarr.Find(ctx, id)
 		if err != nil {
 			return view{}, err
 		}
-		log.Printf("%s requested show %q (tvdb:%d) %s", who(i), show.Title, show.TvdbID, selectionLabel(parts[3]))
-		return view{
-			content: fmt.Sprintf("✅ **%s** (%s) has been requested.", show.Title, strings.ToLower(selectionLabel(parts[3]))),
-			embed:   showEmbed(show),
-		}, nil
+		v := b.seasonView(show, value, uid)
+		v.rows = append(menus, v.rows...)
+		return v, nil
+
+	case action == "treq" && len(args) == 2 && b.Sonarr != nil:
+		sel := args[1]
+		show, err := b.Sonarr.Request(ctx, id, sel)
+		if err != nil {
+			return view{}, err
+		}
+		log.Printf("%s requested show %q (tvdb:%d) %s", who(i), show.Title, show.TvdbID, selectionLabel(sel))
+		content := fmt.Sprintf("**%s** (%s) has been requested.", show.Title, strings.ToLower(selectionLabel(sel)))
+		if b.Store != nil && b.Cfg.NotifyRequesters {
+			b.subscribe(show, sel, uid)
+			content += " You will be notified when it's available."
+		}
+		return view{content: content, embed: showEmbed(show)}, nil
+
+	case action == "tnote" && len(args) == 2 && b.Sonarr != nil && b.Store != nil:
+		sel := args[1]
+		show, err := b.Sonarr.Find(ctx, id)
+		if err != nil {
+			return view{}, err
+		}
+		b.subscribe(show, sel, uid)
+		v := b.seasonView(show, sel, uid)
+		v.rows = append(menus, v.rows...)
+		return v, nil
 	}
 	return view{content: "This request has expired, please start again."}, nil
 }
 
-func (b *Bot) searchMovies(ctx context.Context, term string) (view, error) {
+func (b *Bot) searchMovies(ctx context.Context, uid, term string) (view, error) {
 	movies, err := b.Radarr.Search(ctx, term)
 	if err != nil {
 		return view{}, err
@@ -217,12 +304,12 @@ func (b *Bot) searchMovies(ctx context.Context, term string) (view, error) {
 		if err != nil {
 			return view{}, err
 		}
-		return movieView(m), nil
+		return b.movieView(m, uid), nil
 	}
-	return view{rows: []discordgo.MessageComponent{menu("m:sel", "Select a movie", options)}}, nil
+	return view{rows: []discordgo.MessageComponent{menu("msel:"+uid, "Select a movie", options)}}, nil
 }
 
-func (b *Bot) searchShows(ctx context.Context, term string) (view, error) {
+func (b *Bot) searchShows(ctx context.Context, uid, term string) (view, error) {
 	shows, err := b.Sonarr.Search(ctx, term)
 	if err != nil {
 		return view{}, err
@@ -249,23 +336,95 @@ func (b *Bot) searchShows(ctx context.Context, term string) (view, error) {
 		if err != nil {
 			return view{}, err
 		}
-		return showView(show), nil
+		return showView(show, uid), nil
 	}
-	return view{rows: []discordgo.MessageComponent{menu("t:sel", "Select a TV show", options)}}, nil
+	return view{rows: []discordgo.MessageComponent{menu("tsel:"+uid, "Select a TV show", options)}}, nil
 }
 
-func movieView(m *arr.Movie) view {
-	btn := discordgo.Button{Label: "Request", Style: discordgo.SuccessButton, CustomID: fmt.Sprintf("m:req:%d", m.TmdbID)}
+func (b *Bot) movieView(m *arr.Movie, uid string) view {
+	v := view{embed: movieEmbed(m)}
 	switch {
 	case m.HasFile:
-		btn = discordgo.Button{Label: "Already available", Style: discordgo.SecondaryButton, CustomID: "m:none", Disabled: true}
+		v.rows = buttons(disabled(uid, "Already available"))
 	case m.ID > 0 && m.Monitored:
-		btn = discordgo.Button{Label: "Already requested", Style: discordgo.SecondaryButton, CustomID: "m:none", Disabled: true}
+		v.rows, v.content = b.requested(uid, fmt.Sprintf("mnote:%s:%d", uid, m.TmdbID), b.Store != nil && b.Store.HasMovie(m.TmdbID, uid))
+	default:
+		v.rows = buttons(discordgo.Button{Label: "Request", Style: discordgo.SuccessButton, CustomID: fmt.Sprintf("mreq:%s:%d", uid, m.TmdbID)})
 	}
-	return view{
-		embed: movieEmbed(m),
-		rows:  []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{btn}}},
+	return v
+}
+
+func (b *Bot) seasonView(show *arr.Series, sel, uid string) view {
+	v := view{embed: showEmbed(show)}
+	switch show.SelectionState(sel) {
+	case arr.StateAvailable:
+		v.rows = buttons(disabled(uid, "Already available"))
+	case arr.StateRequested:
+		v.rows, v.content = b.requested(uid, fmt.Sprintf("tnote:%s:%d:%s", uid, show.TvdbID, sel), b.subscribed(show, sel, uid))
+	default:
+		v.rows = buttons(discordgo.Button{
+			Label:    "Request " + strings.ToLower(selectionLabel(sel)),
+			Style:    discordgo.SuccessButton,
+			CustomID: fmt.Sprintf("treq:%s:%d:%s", uid, show.TvdbID, sel),
+		})
 	}
+	return v
+}
+
+func (b *Bot) requested(uid, notifyID string, subscribed bool) ([]discordgo.MessageComponent, string) {
+	row := []discordgo.MessageComponent{disabled(uid, "Already requested")}
+	switch {
+	case b.Store == nil:
+		return buttons(row...), ""
+	case subscribed:
+		return buttons(row...), "You will be notified when it's available."
+	}
+	row = append(row, discordgo.Button{
+		Label:    "Notify me",
+		Style:    discordgo.PrimaryButton,
+		CustomID: notifyID,
+	})
+	return buttons(row...), ""
+}
+
+func showSubs(show *arr.Series, sel, uid string) []store.ShowSub {
+	if sel == arr.SelFuture {
+		next := 1
+		for _, se := range show.Seasons {
+			next = max(next, se.SeasonNumber+1)
+		}
+		return []store.ShowSub{{User: uid, Season: next, Future: true}}
+	}
+	var subs []store.ShowSub
+	for _, se := range show.Seasons {
+		if !arr.Wants(sel, se.SeasonNumber) || show.SeasonState(se) == arr.StateAvailable {
+			continue
+		}
+		sub := store.ShowSub{User: uid, Season: se.SeasonNumber}
+		if se.Statistics != nil {
+			sub.Have = se.Statistics.EpisodeFileCount
+		}
+		subs = append(subs, sub)
+	}
+	return subs
+}
+
+func (b *Bot) subscribe(show *arr.Series, sel, uid string) {
+	for _, sub := range showSubs(show, sel, uid) {
+		b.Store.AddShow(show.TvdbID, sub)
+	}
+}
+
+func (b *Bot) subscribed(show *arr.Series, sel, uid string) bool {
+	if b.Store == nil {
+		return false
+	}
+	for _, sub := range showSubs(show, sel, uid) {
+		if !b.Store.HasShow(show.TvdbID, sub) {
+			return false
+		}
+	}
+	return true
 }
 
 func movieEmbed(m *arr.Movie) *discordgo.MessageEmbed {
@@ -280,52 +439,38 @@ func movieEmbed(m *arr.Movie) *discordgo.MessageEmbed {
 	return e
 }
 
-func showView(show *arr.Series) view {
+func showView(show *arr.Series, uid string) view {
 	seasons := show.Seasons
 	if extra := len(seasons) - (maxOptions - 2); extra > 0 {
 		seasons = seasons[extra:]
 	}
 
-	var options []discordgo.SelectMenuOption
-	if show.SelectionState(arr.SelAll) == arr.StateNone {
-		options = append(options, discordgo.SelectMenuOption{Label: selectionLabel(arr.SelAll), Value: arr.SelAll})
+	stateLabel := func(label string, state int) string {
+		switch state {
+		case arr.StateAvailable:
+			return label + " (available)"
+		case arr.StateRequested:
+			return label + " (requested)"
+		}
+		return label
 	}
-	if show.Status != "ended" && show.SelectionState(arr.SelFuture) == arr.StateNone {
-		options = append(options, discordgo.SelectMenuOption{Label: selectionLabel(arr.SelFuture), Value: arr.SelFuture})
+
+	options := []discordgo.SelectMenuOption{{Label: stateLabel(selectionLabel(arr.SelAll), show.SelectionState(arr.SelAll)), Value: arr.SelAll}}
+	if show.Status != "ended" {
+		options = append(options, discordgo.SelectMenuOption{
+			Label: stateLabel(selectionLabel(arr.SelFuture), show.SelectionState(arr.SelFuture)),
+			Value: arr.SelFuture,
+		})
 	}
 	for _, se := range seasons {
-		label := selectionLabel(strconv.Itoa(se.SeasonNumber))
-		switch show.SeasonState(se) {
-		case arr.StateAvailable:
-			label += " (available)"
-		case arr.StateRequested:
-			label += " (requested)"
-		}
-		options = append(options, discordgo.SelectMenuOption{Label: label, Value: strconv.Itoa(se.SeasonNumber)})
-	}
-	if len(options) == 0 {
-		options = append(options, discordgo.SelectMenuOption{Label: selectionLabel(arr.SelAll), Value: arr.SelAll})
+		n := strconv.Itoa(se.SeasonNumber)
+		options = append(options, discordgo.SelectMenuOption{Label: stateLabel(selectionLabel(n), show.SeasonState(se)), Value: n})
 	}
 
 	return view{
 		embed: showEmbed(show),
-		rows:  []discordgo.MessageComponent{menu(fmt.Sprintf("t:season:%d", show.TvdbID), "Select a season", options)},
+		rows:  []discordgo.MessageComponent{menu(fmt.Sprintf("tseason:%s:%d", uid, show.TvdbID), "Select a season", options)},
 	}
-}
-
-func seasonButton(show *arr.Series, sel string) discordgo.MessageComponent {
-	btn := discordgo.Button{
-		Label:    "Request " + strings.ToLower(selectionLabel(sel)),
-		Style:    discordgo.SuccessButton,
-		CustomID: fmt.Sprintf("t:req:%d:%s", show.TvdbID, sel),
-	}
-	switch show.SelectionState(sel) {
-	case arr.StateAvailable:
-		btn = discordgo.Button{Label: "Already available", Style: discordgo.SecondaryButton, CustomID: "t:none", Disabled: true}
-	case arr.StateRequested:
-		btn = discordgo.Button{Label: "Already requested", Style: discordgo.SecondaryButton, CustomID: "t:none", Disabled: true}
-	}
-	return discordgo.ActionsRow{Components: []discordgo.MessageComponent{btn}}
 }
 
 func showEmbed(show *arr.Series) *discordgo.MessageEmbed {
@@ -364,6 +509,14 @@ func menu(id, placeholder string, options []discordgo.SelectMenuOption) discordg
 	}}
 }
 
+func buttons(row ...discordgo.MessageComponent) []discordgo.MessageComponent {
+	return []discordgo.MessageComponent{discordgo.ActionsRow{Components: row}}
+}
+
+func disabled(uid, label string) discordgo.Button {
+	return discordgo.Button{Label: label, Style: discordgo.SecondaryButton, CustomID: "none:" + uid, Disabled: true}
+}
+
 // Select menus of the message up to and including the one just used, with its choice marked.
 func keptMenus(msg *discordgo.Message, usedID, value string) []discordgo.MessageComponent {
 	var rows []discordgo.MessageComponent
@@ -381,7 +534,9 @@ func keptMenus(msg *discordgo.Message, usedID, value string) []discordgo.Message
 		}
 		kept := discordgo.SelectMenu{CustomID: sm.CustomID, Placeholder: sm.Placeholder}
 		for _, o := range sm.Options {
-			o.Default = sm.CustomID == usedID && o.Value == value || sm.CustomID != usedID && o.Default
+			if sm.CustomID == usedID {
+				o.Default = o.Value == value
+			}
 			kept.Options = append(kept.Options, o)
 		}
 		rows = append(rows, discordgo.ActionsRow{Components: []discordgo.MessageComponent{kept}})
@@ -390,6 +545,16 @@ func keptMenus(msg *discordgo.Message, usedID, value string) []discordgo.Message
 		}
 	}
 	return rows
+}
+
+func userID(i *discordgo.InteractionCreate) string {
+	if i.Member != nil && i.Member.User != nil {
+		return i.Member.User.ID
+	}
+	if i.User != nil {
+		return i.User.ID
+	}
+	return ""
 }
 
 func who(i *discordgo.InteractionCreate) string {

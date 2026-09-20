@@ -48,9 +48,8 @@ func (r *Radarr) inLibrary(ctx context.Context, tmdbID int) (*Movie, error) {
 	return &movies[0], nil
 }
 
-// Library entry if present, lookup result otherwise.
 func (r *Radarr) Find(ctx context.Context, tmdbID int) (*Movie, error) {
-	if m, err := r.inLibrary(ctx, tmdbID); err != nil || m != nil {
+	if m, err := r.InLibrary(ctx, tmdbID); err != nil || m != nil {
 		return m, err
 	}
 	var m Movie

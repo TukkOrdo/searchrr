@@ -13,9 +13,10 @@ import (
 	"searchrr/internal/arr"
 	"searchrr/internal/bot"
 	"searchrr/internal/config"
+	"searchrr/internal/store"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -26,7 +27,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	b := &bot.Bot{}
+	b := &bot.Bot{Cfg: cfg}
 	if cfg.Radarr.URL != "" {
 		b.Radarr = arr.NewRadarr(cfg)
 		go check(b.Radarr)
@@ -34,6 +35,11 @@ func main() {
 	if cfg.Sonarr.URL != "" {
 		b.Sonarr = arr.NewSonarr(cfg)
 		go check(b.Sonarr)
+	}
+	if cfg.NotificationMode != config.NotifyOff {
+		if b.Store, err = store.Open(cfg.DataDir); err != nil {
+			log.Fatalf("notifications: %v (mount a writable folder at %s or set NOTIFICATION_MODE=off)", err, cfg.DataDir)
+		}
 	}
 
 	s, err := discordgo.New("Bot " + cfg.Token)
@@ -50,16 +56,42 @@ func main() {
 		log.Fatalf("discord: %v", err)
 	}
 	defer s.Close()
+	registerCommands(s, cfg, b.Commands())
 
-	if _, err := s.ApplicationCommandBulkOverwrite(s.State.User.ID, cfg.GuildID, b.Commands()); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if b.Store != nil {
+		go b.RunNotifier(ctx, s)
+	}
+	<-ctx.Done()
+	log.Print("shutting down")
+}
+
+func registerCommands(s *discordgo.Session, cfg *config.Config, cmds []*discordgo.ApplicationCommand) {
+	app := s.State.User.ID
+	scope := cfg.GuildID
+	if cfg.AllowDMs {
+		scope = ""
+	}
+	if _, err := s.ApplicationCommandBulkOverwrite(app, scope, cmds); err != nil {
 		log.Fatalf("registering commands: %v", err)
 	}
-	log.Print("slash commands registered")
+	if scope == "" {
+		log.Print("slash commands registered globally, new commands can take up to an hour to show up")
+	} else {
+		log.Printf("slash commands registered for server %s", scope)
+	}
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	log.Print("shutting down")
+	if cfg.GuildID == "" {
+		return
+	}
+	other := ""
+	if scope == "" {
+		other = cfg.GuildID
+	}
+	if _, err := s.ApplicationCommandBulkOverwrite(app, other, []*discordgo.ApplicationCommand{}); err != nil {
+		log.Printf("warning: clearing duplicate commands: %v", err)
+	}
 }
 
 func check(c interface{ Check(context.Context) error }) {

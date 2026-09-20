@@ -68,7 +68,7 @@ func (s *Series) SelectionState(sel string) int {
 	}
 	state, matched := StateAvailable, false
 	for _, se := range s.Seasons {
-		if wants(sel, se.SeasonNumber) {
+		if Wants(sel, se.SeasonNumber) {
 			matched = true
 			state = min(state, s.SeasonState(se))
 		}
@@ -79,7 +79,7 @@ func (s *Series) SelectionState(sel string) int {
 	return state
 }
 
-func wants(sel string, seasonNumber int) bool {
+func Wants(sel string, seasonNumber int) bool {
 	switch sel {
 	case SelAll:
 		return seasonNumber > 0
@@ -105,7 +105,7 @@ func (s *Sonarr) Search(ctx context.Context, term string) ([]Series, error) {
 	return found, err
 }
 
-func (s *Sonarr) inLibrary(ctx context.Context, tvdbID int) (*Series, error) {
+func (s *Sonarr) InLibrary(ctx context.Context, tvdbID int) (*Series, error) {
 	var found []Series
 	if err := s.get(ctx, "/series", url.Values{"tvdbId": {strconv.Itoa(tvdbID)}}, &found); err != nil {
 		return nil, err
@@ -116,9 +116,8 @@ func (s *Sonarr) inLibrary(ctx context.Context, tvdbID int) (*Series, error) {
 	return &found[0], nil
 }
 
-// Library entry if present, lookup result otherwise.
 func (s *Sonarr) Find(ctx context.Context, tvdbID int) (*Series, error) {
-	if se, err := s.inLibrary(ctx, tvdbID); err != nil || se != nil {
+	if se, err := s.InLibrary(ctx, tvdbID); err != nil || se != nil {
 		return se, err
 	}
 	found, err := s.Search(ctx, "tvdb:"+strconv.Itoa(tvdbID))
@@ -148,7 +147,7 @@ func (s *Sonarr) Request(ctx context.Context, tvdbID int, sel string) (*Series, 
 	for _, se := range show.Seasons {
 		seasons = append(seasons, map[string]any{
 			"seasonNumber": se.SeasonNumber,
-			"monitored":    wants(sel, se.SeasonNumber),
+			"monitored":    Wants(sel, se.SeasonNumber),
 		})
 	}
 	return show, s.call(ctx, http.MethodPost, "/series", nil, map[string]any{
@@ -183,7 +182,7 @@ func (s *Sonarr) update(ctx context.Context, id int, sel string) error {
 			se, _ := item.(map[string]any)
 			num, _ := se["seasonNumber"].(json.Number)
 			n, err := num.Int64()
-			if err == nil && wants(sel, int(n)) {
+			if err == nil && Wants(sel, int(n)) {
 				se["monitored"] = v
 				targets = append(targets, int(n))
 			}

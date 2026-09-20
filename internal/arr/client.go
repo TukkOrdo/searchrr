@@ -43,7 +43,6 @@ type defaults struct {
 	tags       []int
 }
 
-// Shared Sonarr/Radarr v3 API client.
 type client struct {
 	name string
 	base string
@@ -119,7 +118,6 @@ func (a *client) Check(ctx context.Context) error {
 	return err
 }
 
-// Resolves quality profile, root folder and tags once, then caches them.
 func (a *client) defaults(ctx context.Context) (*defaults, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
